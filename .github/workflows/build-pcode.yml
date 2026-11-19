@@ -1,0 +1,145 @@
+# Rebuild the .p files in this repository from the private source,
+# Waltham-Data-Science/NDI-compress, with NDI-matlab's ndi.file.pfilemirror.
+#
+# Runs only on a push to V2 that changes build-source-ref (the one-line file
+# naming the NDI-compress ref or sha to build). It commits the rebuilt .p
+# files back to V2 and never touches main.
+#
+# Needs the repository secret NDI_COMPRESS_READ_TOKEN (read access to
+# Waltham-Data-Science/NDI-compress). Without it the job prints
+# "NOT BUILT: secret NDI_COMPRESS_READ_TOKEN missing" and succeeds.
+#
+# No loop: the bot commit changes only +ndi/+compress/*.p (never
+# build-source-ref), and pushes made with GITHUB_TOKEN start no workflow runs.
+
+name: Build p-code from NDI-compress
+
+on:
+  push:
+    branches: [V2]
+    paths: [build-source-ref]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-pcode-V2
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse any branch but V2
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/V2" ]; then
+            echo "REFUSED: this workflow builds only on refs/heads/V2 (got ${GITHUB_REF})"
+            exit 1
+          fi
+
+      - name: Check for the read token
+        id: token
+        env:
+          NDI_COMPRESS_READ_TOKEN: ${{ secrets.NDI_COMPRESS_READ_TOKEN }}
+        run: |
+          if [ -z "${NDI_COMPRESS_READ_TOKEN}" ]; then
+            echo "NOT BUILT: secret NDI_COMPRESS_READ_TOKEN missing"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out this repository (the pushed V2 commit)
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          path: target
+          fetch-depth: 0
+
+      - name: Read build-source-ref
+        if: steps.token.outputs.present == 'true'
+        id: ref
+        run: |
+          ref="$(head -n 1 target/build-source-ref | tr -d '[:space:]')"
+          if [ -z "$ref" ]; then
+            echo "REFUSED: build-source-ref is empty"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "build-source-ref: $ref"
+
+      - name: Check out NDI-compress (read-only use of the token)
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Waltham-Data-Science/NDI-compress
+          ref: ${{ steps.ref.outputs.ref }}
+          token: ${{ secrets.NDI_COMPRESS_READ_TOKEN }}
+          path: source
+          persist-credentials: false
+
+      - name: Check out NDI-matlab V2 (for ndi.file.pfilemirror)
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: VH-Lab/NDI-matlab
+          ref: V2
+          path: ndi-matlab
+          persist-credentials: false
+          sparse-checkout: src/ndi/+ndi/+file
+
+      - name: Record commits
+        if: steps.token.outputs.present == 'true'
+        id: shas
+        run: |
+          src_sha="$(git -C source rev-parse HEAD)"
+          ndi_sha="$(git -C ndi-matlab rev-parse HEAD)"
+          echo "source=$src_sha" >> "$GITHUB_OUTPUT"
+          echo "ndi=$ndi_sha" >> "$GITHUB_OUTPUT"
+          echo "NDI-compress: $src_sha"
+          echo "NDI-matlab:   $ndi_sha"
+
+      - name: Set up MATLAB
+        if: steps.token.outputs.present == 'true'
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          # P-code from a release loads in that release and later ones.
+          # R2024b is the oldest release NDI-matlab's release tests run.
+          release: R2024b
+
+      - name: Run pfilemirror (+ndi/+compress only)
+        if: steps.token.outputs.present == 'true'
+        uses: matlab-actions/run-command@v2
+        with:
+          command: |
+            addpath(fullfile(pwd, 'ndi-matlab', 'src', 'ndi'));
+            disp(which('ndi.file.pfilemirror'));
+            b = ndi.file.pfilemirror(fullfile(pwd, 'source', '+ndi', '+compress'), ...
+                fullfile(pwd, 'target', '+ndi', '+compress'));
+            assert(b == 1, 'pfilemirror did not finish');
+
+      - name: Commit and push the rebuilt .p files to V2
+        if: steps.token.outputs.present == 'true'
+        working-directory: target
+        env:
+          SRC_SHA: ${{ steps.shas.outputs.source }}
+          NDI_SHA: ${{ steps.shas.outputs.ndi }}
+          SRC_REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          git add -A -- '+ndi/+compress/*.p'
+          if git diff --cached --quiet; then
+            echo "No change: the .p files built from NDI-compress@${SRC_SHA} match V2."
+            exit 0
+          fi
+          if git diff --cached --name-only | grep -qvE '^\+ndi/\+compress/[^/]+\.p$'; then
+            echo "REFUSED: staged changes outside +ndi/+compress/*.p"
+            git diff --cached --name-only
+            exit 1
+          fi
+          git diff --cached --stat
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Rebuild .p files from NDI-compress@${SRC_SHA}" \
+            -m "build-source-ref: ${SRC_REF}" \
+            -m "Built with ndi.file.pfilemirror from VH-Lab/NDI-matlab@${NDI_SHA} by ${GITHUB_WORKFLOW} run ${GITHUB_RUN_ID}."
+          git push origin HEAD:refs/heads/V2
